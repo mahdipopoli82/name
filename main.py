@@ -3,13 +3,12 @@ import sqlite3
 import time
 import aiohttp
 from telethon import TelegramClient, events, Button
-from telethon.sessions import MemorySession
-from telethon.errors import MessageNotModifiedError
+from telethon.errors import MessageNotModifiedError, FloodWaitError
 
 # ==================== CONFIG ====================
 API_ID = 8477522
 API_HASH = '366c19cf69e02cad530261ad81212a85'
-BOT_TOKEN = '8772556192:AAHLuWeOD2nCGhxcUN2t2mogSxOuVpiFjDY'
+BOT_TOKEN = '8772556192:AAGv1og0igBbM-P7akfX2KTljzpv2pcanpM'
 ADMIN_ID = 5190717598
 SMSBOWER_API_KEY = 'd7FVPDHaenCSNq05X1lzSlpQ6Ud30kff'
 SMSBOWER_URL = 'https://smsbower.page/stubs/handler_api.php'
@@ -69,12 +68,25 @@ def create_user(uid):
 
 init_db()
 
-client = TelegramClient(MemorySession(), API_ID, API_HASH)
+# سشن فایلی ثابت برای جلوگیری از FloodWait
+client = TelegramClient("shop_bot_session", API_ID, API_HASH)
 
 admin_states = {}
-user_states = {}           # uid: {"cid": x, "step": "custom_qty"}
-auto_check_tasks = {}      # order_id: asyncio.Task
-user_locks = set()
+user_states = {}
+auto_check_tasks = {}
+
+# سیستم قطعی جلوگیری از ارسال دوبار پیام
+PROCESSED_EVENTS = set()
+
+def is_duplicate_event(event_id):
+    """اگر رویداد قبلاً پردازش شده باشد True برمی‌گرداند"""
+    if event_id in PROCESSED_EVENTS:
+        return True
+    PROCESSED_EVENTS.add(event_id)
+    # پاکسازی حافظه در صورت عبور از 10,000 رویداد
+    if len(PROCESSED_EVENTS) > 10000:
+        PROCESSED_EVENTS.clear()
+    return False
 
 # ==================== API ====================
 async def api(action, **kw):
@@ -111,7 +123,7 @@ def admin_buttons():
 # ==================== AUTO CHECK SMS ====================
 async def auto_check_sms(uid, order_id, phone):
     try:
-        for _ in range(120):  # حداکثر ۶ دقیقه
+        for _ in range(120):
             await asyncio.sleep(3)
             
             conn = get_db()
@@ -172,7 +184,7 @@ async def auto_check_sms(uid, order_id, phone):
     except Exception as e:
         print(f"Auto check error: {e}")
 
-# ==================== PROCESS BUY LOGIC ====================
+# ==================== BATCH BUY LOGIC ====================
 async def process_batch_purchase(event, uid, cid, count):
     conn = get_db()
     row = conn.execute("SELECT country_code, name, flag, provider_ids, price FROM countries WHERE id=?", (cid,)).fetchone()
@@ -250,6 +262,10 @@ async def process_batch_purchase(event, uid, cid, count):
 # ==================== START ====================
 @client.on(events.NewMessage(pattern=r'^/start$', incoming=True, func=lambda e: e.is_private))
 async def cmd_start(event):
+    # مسدودسازی پیام‌های تکراری /start بر اساس شناسه پیام تلگرام
+    if is_duplicate_event(f"start_{event.id}"):
+        return
+
     uid = event.sender_id
     create_user(uid)
     user_states.pop(uid, None)
@@ -267,18 +283,18 @@ async def cmd_start(event):
 # ==================== CALLBACK ROUTER ====================
 @client.on(events.CallbackQuery)
 async def callback_router(event):
+    # جلوگیری کامل از تکرار کلیک با استفاده از شناسه یکتای دکمه (Query ID)
+    query_id = getattr(event.query, 'id', None)
+    if query_id and is_duplicate_event(f"query_{query_id}"):
+        await event.answer()
+        return
+
     uid = event.sender_id
     try:
         data = event.data.decode()
     except Exception:
         await event.answer()
         return
-
-    lock_key = f"{uid}_{data}_{int(time.time())}"
-    if lock_key in user_locks:
-        await event.answer("⏳ Processing...")
-        return
-    user_locks.add(lock_key)
 
     try:
         if data == "back_main":
@@ -304,7 +320,6 @@ async def callback_router(event):
             btns.append([Button.inline("🔙 Back", b"back_main")])
             await event.edit("🌍 **Select Country:**", buttons=btns)
 
-        # مرحله انتخاب تعداد (Preset یا Custom)
         elif data.startswith("buy_c_"):
             cid = data.split("_")[2]
             conn = get_db()
@@ -326,14 +341,12 @@ async def callback_router(event):
                 buttons=btns
             )
 
-        # خرید تعداد مشخص
         elif data.startswith("qty_"):
             parts = data.split("_")
             cid, qty = parts[1], int(parts[2])
             await event.answer()
             await process_batch_purchase(event, uid, cid, qty)
 
-        # درخواست ورود تعداد دستی
         elif data.startswith("custom_qty_"):
             cid = data.split("_")[2]
             user_states[uid] = {"step": "custom_qty", "cid": cid}
@@ -380,7 +393,6 @@ async def callback_router(event):
             else:
                 await event.answer(f"{status[:50]}", alert=True)
 
-        # لغو تکی
         elif data.startswith("cnc_ord_"):
             order_id = data.split("_")[2]
             conn = get_db()
@@ -404,14 +416,12 @@ async def callback_router(event):
                 conn.close()
                 add_balance(uid, price)
                 await event.answer(f"✅ Cancelled +{row[2]} & refunded ${price:.2f}", alert=True)
-                # بازگشت به لیست سفارش‌ها
                 await callback_router_active_orders(event, uid)
             else:
                 conn.close()
                 clean_err = res[:50] if not res.startswith("<") else "Wait a moment..."
                 await event.answer(f"❌ Cancel failed: {clean_err}", alert=True)
 
-        # لغو همه سفارش‌ها به‌صورت یکجا
         elif data == "cnc_all":
             conn = get_db()
             active_orders = conn.execute("SELECT order_id, price FROM orders WHERE user_id=? AND status='WAITING'", (uid,)).fetchall()
@@ -500,9 +510,6 @@ async def callback_router(event):
         pass
     except Exception as e:
         print(f"Callback Router Error: {e}")
-    finally:
-        await asyncio.sleep(0.3)
-        user_locks.discard(lock_key)
 
 async def callback_router_active_orders(event, uid):
     conn = get_db()
@@ -524,10 +531,12 @@ async def callback_router_active_orders(event, uid):
 # ==================== TEXT INPUT HANDLER ====================
 @client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private and not e.text.startswith('/')))
 async def msg_handler(event):
+    if is_duplicate_event(f"msg_{event.id}"):
+        return
+
     uid = event.sender_id
     text = event.raw_text.strip()
 
-    # دریافت تعداد کاستوم کاربر
     if uid in user_states and user_states[uid].get("step") == "custom_qty":
         cid = user_states[uid].get("cid")
         user_states.pop(uid, None)
@@ -542,7 +551,6 @@ async def msg_handler(event):
             await event.respond("❌ Invalid number. Please send an integer (e.g. 3).")
             return
 
-    # دریافت ورودی‌های ادمین
     if uid != ADMIN_ID or uid not in admin_states:
         return
 
@@ -611,10 +619,16 @@ async def msg_handler(event):
 
 # ==================== RUN ====================
 async def main():
-    print("🤖 Starting single instance with MemorySession...")
-    await client.start(bot_token=BOT_TOKEN)
-    print("✅ Ready!")
-    await client.run_until_disconnected()
+    print("🤖 Starting client...")
+    while True:
+        try:
+            await client.start(bot_token=BOT_TOKEN)
+            print("✅ Ready and listening for events!")
+            await client.run_until_disconnected()
+            break
+        except FloodWaitError as e:
+            print(f"⏳ FloodWait detected. Waiting {e.seconds} seconds before login...")
+            await asyncio.sleep(e.seconds + 2)
 
 if __name__ == "__main__":
     asyncio.run(main())
